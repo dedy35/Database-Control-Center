@@ -6,6 +6,7 @@ from decimal import Decimal
 from sqlalchemy import Column, DateTime, ForeignKey, Integer, MetaData, Numeric, String, Table, func, select
 from sqlalchemy.engine import Engine
 
+from src.config import DEFAULT_SQLITE_URL
 from src.db import get_database_type, get_engine
 
 
@@ -236,7 +237,7 @@ def ensure_demo_seed_for_sqlite(engine: Engine | None = None) -> None:
 
 
 def main() -> None:
-    engine = get_engine()
+    engine = get_engine(DEFAULT_SQLITE_URL)
     seed_demo_database(engine)
     print(f"Demo database ready: {engine.url}")
 
