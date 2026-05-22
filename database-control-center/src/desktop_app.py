@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDateEdit,
     QFileDialog,
     QFormLayout,
@@ -38,6 +39,8 @@ from PySide6.QtWidgets import (
 )
 from sqlalchemy.exc import SQLAlchemyError
 
+from src.activity_log import log_activity
+from src.ai_chat_panel import AIChatPanel
 from src.ai_service import (
     detect_anomalies,
     draft_report,
@@ -47,16 +50,13 @@ from src.ai_service import (
     summarize_dataframe,
 )
 from src.audit_service import audit_log_exists, create_audit_log_table, fetch_audit_logs
+from src.confirmation_dialog import ConfirmationPreviewDialog
 from src.config import get_settings
 from src.connection_manager import ConnectionManager, build_manual_profile
 from src.crud_service import (
-    bulk_import_records,
     get_record_by_pk,
-    insert_record,
     list_record_choices,
     prepare_record_payload,
-    soft_delete_record,
-    update_record,
 )
 from src.db import get_database_type, mask_database_url, test_connection
 from src.demo_seed import ensure_demo_seed_for_sqlite
@@ -65,6 +65,16 @@ from src.loading_ui import loading_operation
 from src.ollama_client import check_ollama_health, list_models
 from src.query_builder import SAFE_LIMITS, build_select_statement, fetch_dataframe
 from src.schema_inspector import get_table_metadata, get_table_names, get_table_row_count
+from src.ui_styles import (
+    AppCard,
+    ModernMessageBanner,
+    ModernSearchInput,
+    PillBadge,
+    PrimaryButton,
+    SecondaryButton,
+    apply_light_style,
+)
+from src.write_guard import WriteActionPlan, execute_approved_write, log_write_rejected
 
 
 PAGE_TITLES = [
@@ -104,6 +114,29 @@ def stringify_value(value: Any) -> str:
     if value is None:
         return ""
     return str(value)
+
+
+def dataframe_sample(frame: pd.DataFrame, limit: int = 20) -> list[dict[str, Any]]:
+    if frame.empty:
+        return []
+    sample = frame.head(limit).copy()
+    return sample.to_dict(orient="records")
+
+
+def friendly_error_text(error: Exception | str) -> str:
+    text = mask_database_url(str(error))
+    lowered = text.lower()
+    if "ollama unavailable" in lowered or "connection refused" in lowered and "11434" in text:
+        return "Ollama is not running. Start it with: ollama serve"
+    if "no primary key" in lowered:
+        return "The selected table has no primary key, so safe editing is disabled."
+    if "permissionerror" in lowered or "blocked because the app is currently in read-only mode" in lowered:
+        return "This action was blocked because the app is currently in read-only mode."
+    if "connection failed" in lowered or "operationalerror" in lowered:
+        return "Connection failed. Please check host, port, username, password, and database name."
+    if "audit_log" in lowered and "does not contain" in lowered:
+        return "This action needs an audit_log table in the active database before it can continue."
+    return text
 
 
 class PandasTableModel(QAbstractTableModel):
@@ -292,12 +325,20 @@ class BasePage(QWidget):
     def __init__(self, window: "MainWindow") -> None:
         super().__init__()
         self.window = window
+        self.page_title = self.__class__.__name__
 
     def on_database_changed(self) -> None:
         return None
 
     def on_activated(self) -> None:
         return None
+
+    def get_ai_context(self, options: dict[str, bool] | None = None) -> dict[str, Any]:
+        return {
+            "page": self.page_title,
+            "database_name": self.window.manager.get_active_database_name(),
+            "database_type": get_database_type(self.window.manager.get_active_database_url()),
+        }
 
 
 class ConnectionManagerPage(BasePage):
@@ -428,7 +469,7 @@ class ConnectionManagerPage(BasePage):
         self.current_name.setText(status["name"])
         self.current_type.setText(status["type"])
         self.current_url.setText(status["masked_url"])
-        self.current_status.setText("Connected" if success else message)
+        self.current_status.setText("Connected" if success else friendly_error_text(message))
 
     def _sync_manual_type_visibility(self, selected: str) -> None:
         selected = selected.lower()
@@ -518,7 +559,7 @@ class ConnectionManagerPage(BasePage):
         if success:
             self.window.show_info("Manual connection", f"{message}\n\nMasked URL:\n{mask_database_url(profile['url'])}")
         else:
-            self.window.show_warning("Manual connection", message)
+            self.window.show_warning("Manual connection", friendly_error_text(message))
 
     def _connect_manual_profile(self) -> None:
         try:
@@ -534,6 +575,21 @@ class ConnectionManagerPage(BasePage):
             self.window.show_warning("Database connection", "No profile is selected.")
             return
         self.window.connect_to_profile(self.profile_lookup[index], add_to_session_profiles=False)
+
+    def get_ai_context(self, options: dict[str, bool] | None = None) -> dict[str, Any]:
+        context = super().get_ai_context(options)
+        status = self.window.manager.current_database_status()
+        ok, message = test_connection(status["url"])
+        context.update(
+            {
+                "active_database_name": status["name"],
+                "database_type": status["type"],
+                "connection_status": "connected" if ok else friendly_error_text(message),
+                "available_profiles": [profile["name"] for profile in self.profile_lookup],
+                "mode": self.window.safety_mode,
+            }
+        )
+        return context
 
 
 class DashboardPage(BasePage):
@@ -596,6 +652,17 @@ class DashboardPage(BasePage):
                     audit_frame[column] = audit_frame[column].apply(lambda value: json.dumps(value, ensure_ascii=False, default=str))
         self.audit_table.set_frame(audit_frame)
 
+    def get_ai_context(self, options: dict[str, bool] | None = None) -> dict[str, Any]:
+        context = super().get_ai_context(options)
+        context.update(
+            {
+                "summary": self.summary_label.text(),
+                "table_counts": dataframe_sample(self.row_counts.dataframe()),
+                "recent_audit_actions": dataframe_sample(self.audit_table.dataframe()),
+            }
+        )
+        return context
+
 
 class DataExplorerPage(BasePage):
     def __init__(self, window: "MainWindow") -> None:
@@ -606,8 +673,7 @@ class DataExplorerPage(BasePage):
         layout = QVBoxLayout(self)
         controls = QGridLayout()
         self.table_combo = QComboBox()
-        self.keyword_edit = QLineEdit()
-        self.keyword_edit.setPlaceholderText("Keyword search across text columns")
+        self.keyword_edit = ModernSearchInput("Keyword search across text columns")
         self.limit_combo = QComboBox()
         self.limit_combo.addItems([str(value) for value in sorted(SAFE_LIMITS)])
         self.limit_combo.setCurrentText("100")
@@ -615,10 +681,10 @@ class DataExplorerPage(BasePage):
         self.direction_combo = QComboBox()
         self.direction_combo.addItems(["asc", "desc"])
         self.include_deleted_checkbox = QCheckBox("Include soft-deleted rows")
-        self.search_button = QPushButton("Search")
-        self.export_csv_button = QPushButton("Export CSV")
-        self.export_excel_button = QPushButton("Export Excel")
-        self.clear_filters_button = QPushButton("Reset Filters")
+        self.search_button = PrimaryButton("Search")
+        self.export_csv_button = SecondaryButton("Export CSV")
+        self.export_excel_button = SecondaryButton("Export Excel")
+        self.clear_filters_button = SecondaryButton("Reset Filters")
 
         controls.addWidget(QLabel("Table"), 0, 0)
         controls.addWidget(self.table_combo, 0, 1)
@@ -636,6 +702,18 @@ class DataExplorerPage(BasePage):
         controls.addWidget(self.export_excel_button, 3, 2)
         controls.addWidget(self.clear_filters_button, 3, 3)
         layout.addLayout(controls)
+
+        ai_toolbar = QHBoxLayout()
+        self.ask_selected_row_button = SecondaryButton("Ask AI About Selected Row")
+        self.summarize_results_button = SecondaryButton("Summarize Result")
+        self.suggest_filters_button = SecondaryButton("Suggest Filters")
+        self.report_draft_button = SecondaryButton("Draft Report")
+        ai_toolbar.addWidget(self.ask_selected_row_button)
+        ai_toolbar.addWidget(self.summarize_results_button)
+        ai_toolbar.addWidget(self.suggest_filters_button)
+        ai_toolbar.addWidget(self.report_draft_button)
+        ai_toolbar.addStretch(1)
+        layout.addLayout(ai_toolbar)
 
         filter_group = QGroupBox("Filters")
         filter_layout = QVBoxLayout(filter_group)
@@ -671,6 +749,16 @@ class DataExplorerPage(BasePage):
         self.export_csv_button.clicked.connect(self.export_csv)
         self.export_excel_button.clicked.connect(self.export_excel)
         self.table_combo.currentTextChanged.connect(self._table_changed)
+        self.ask_selected_row_button.clicked.connect(self.ask_ai_about_selected_row)
+        self.summarize_results_button.clicked.connect(
+            lambda: self.window.ai_chat_panel.ask_from_page("Ringkas hasil filter saat ini dan jelaskan insight utamanya.")
+        )
+        self.suggest_filters_button.clicked.connect(
+            lambda: self.window.ai_chat_panel.ask_from_page("Bantu sarankan filter yang berguna untuk investigasi data pada halaman ini.")
+        )
+        self.report_draft_button.clicked.connect(
+            lambda: self.window.ai_chat_panel.ask_from_page("Buatkan draft report dari hasil yang sedang terlihat pada halaman ini.")
+        )
 
     def on_database_changed(self) -> None:
         self.refresh_tables()
@@ -732,6 +820,16 @@ class DataExplorerPage(BasePage):
 
     def current_filters(self) -> list[dict[str, Any]]:
         return [row.to_filter() for row in self.filter_rows]
+
+    def selected_row(self) -> dict[str, Any] | None:
+        frame = self.results_view.dataframe()
+        if frame.empty:
+            return None
+        index = self.results_view.currentIndex()
+        row = index.row() if index.isValid() else 0
+        if row < 0 or row >= len(frame):
+            return None
+        return dict(frame.iloc[row].to_dict())
 
     def search(self) -> None:
         table_name = self.table_combo.currentText()
@@ -797,6 +895,37 @@ class DataExplorerPage(BasePage):
             self.filter_rows[-1].apply_filter(filter_payload)
         self.search()
 
+    def ask_ai_about_selected_row(self) -> None:
+        row = self.selected_row()
+        if not row:
+            self.window.show_warning("Data Explorer", "Select a row or load results first.")
+            return
+        self.window.ai_chat_panel.ask_from_page("Jelaskan record yang sedang dipilih, potensi risikonya, dan apa yang terlihat penting.")
+
+    def get_ai_context(self, options: dict[str, bool] | None = None) -> dict[str, Any]:
+        context = super().get_ai_context(options)
+        context.update(
+            {
+                "current_table": self.table_combo.currentText(),
+                "filters": self.current_filters(),
+                "keyword": self.keyword_edit.text().strip(),
+                "sort_by": self.sort_combo.currentText(),
+                "sort_direction": self.direction_combo.currentText(),
+                "limit": self.limit_combo.currentText(),
+                "include_soft_deleted": self.include_deleted_checkbox.isChecked(),
+                "visible_columns": self.metadata["column_names"] if self.metadata else [],
+                "row_count": len(self.results_view.dataframe()),
+            }
+        )
+        options = options or {}
+        if options.get("include_schema", True) and self.metadata:
+            context["schema"] = self.metadata["columns"]
+        if options.get("include_selected_row", True):
+            context["selected_row"] = self.selected_row()
+        if options.get("include_result_sample", True):
+            context["result_sample"] = dataframe_sample(self.results_view.dataframe())
+        return context
+
 
 class AddRecordPage(BasePage):
     def __init__(self, window: "MainWindow") -> None:
@@ -805,6 +934,12 @@ class AddRecordPage(BasePage):
         self.pending_payload: dict[str, Any] | None = None
 
         layout = QVBoxLayout(self)
+        layout.addWidget(
+            ModernMessageBanner(
+                "Default mode is read-only. Every insert needs a final approval popup before execution.",
+                "warning",
+            )
+        )
         header = QHBoxLayout()
         self.table_combo = QComboBox()
         self.advanced_checkbox = QCheckBox("Include advanced/system fields")
@@ -900,23 +1035,33 @@ class AddRecordPage(BasePage):
         if not self.pending_payload:
             self.window.show_warning("Add Record", "Generate a preview before executing the insert.")
             return
-        try:
-            with loading_operation("Saving changes...", self.window):
-                record_id = insert_record(
-                    self.window.active_engine(),
-                    self.table_combo.currentText(),
-                    self.form_widget.values(),
-                    actor=self.window.actor,
-                    include_system_fields=self.advanced_checkbox.isChecked(),
-                )
-        except Exception as exc:
-            self.window.show_error("Add Record", exc)
+        plan = self.window.build_insert_plan(
+            table_name=self.table_combo.currentText(),
+            payload=self.pending_payload,
+            include_system_fields=self.advanced_checkbox.isChecked(),
+            source="manual_ui",
+            reason="Manual insert from Add Record page.",
+        )
+        result = self.window.review_and_execute_write_plan(plan)
+        if result is None:
             return
-        self.window.status_message(f"Record {record_id} inserted successfully.")
+        self.window.status_message(f"Record {result} inserted successfully.")
         self.pending_payload = None
         self.preview_text.clear()
         self.confirm_checkbox.setChecked(False)
         self._refresh_form()
+
+    def get_ai_context(self, options: dict[str, bool] | None = None) -> dict[str, Any]:
+        context = super().get_ai_context(options)
+        context.update(
+            {
+                "selected_table": self.table_combo.currentText(),
+                "form_values": self.form_widget.values(),
+                "preview_payload": self.pending_payload,
+                "advanced_fields_enabled": self.advanced_checkbox.isChecked(),
+            }
+        )
+        return context
 
 
 class EditRecordPage(BasePage):
@@ -927,6 +1072,12 @@ class EditRecordPage(BasePage):
         self.pending_update: dict[str, Any] | None = None
 
         layout = QVBoxLayout(self)
+        layout.addWidget(
+            ModernMessageBanner(
+                "Default mode is read-only. Update and soft delete always require a review popup before execution.",
+                "warning",
+            )
+        )
         selector = QGridLayout()
         self.table_combo = QComboBox()
         self.record_combo = QComboBox()
@@ -1077,18 +1228,17 @@ class EditRecordPage(BasePage):
             self.window.show_warning("Edit Record", "Generate a preview before executing the update.")
             return
         record_id = self.record_combo.currentData()
-        try:
-            with loading_operation("Saving changes...", self.window):
-                rowcount = update_record(
-                    self.window.active_engine(),
-                    self.table_combo.currentText(),
-                    record_id=record_id,
-                    data=self.form_widget.values(),
-                    actor=self.window.actor,
-                    include_system_fields=self.advanced_checkbox.isChecked(),
-                )
-        except Exception as exc:
-            self.window.show_error("Edit Record", exc)
+        plan = self.window.build_update_plan(
+            table_name=self.table_combo.currentText(),
+            record_id=record_id,
+            before_data=self.current_record or {},
+            payload=self.pending_update,
+            include_system_fields=self.advanced_checkbox.isChecked(),
+            source="manual_ui",
+            reason="Manual update from Edit Record page.",
+        )
+        rowcount = self.window.review_and_execute_write_plan(plan)
+        if rowcount is None:
             return
         self.window.status_message(f"Updated {rowcount} record(s).")
         self.update_confirm_checkbox.setChecked(False)
@@ -1099,20 +1249,32 @@ class EditRecordPage(BasePage):
             self.window.show_warning("Edit Record", "Confirm the soft delete before executing it.")
             return
         record_id = self.record_combo.currentData()
-        try:
-            with loading_operation("Saving changes...", self.window):
-                rowcount = soft_delete_record(
-                    self.window.active_engine(),
-                    self.table_combo.currentText(),
-                    record_id=record_id,
-                    actor=self.window.actor,
-                )
-        except Exception as exc:
-            self.window.show_error("Edit Record", exc)
+        plan = self.window.build_soft_delete_plan(
+            table_name=self.table_combo.currentText(),
+            record_id=record_id,
+            before_data=self.current_record or {},
+            source="manual_ui",
+            reason="Manual soft delete from Edit Record page.",
+        )
+        rowcount = self.window.review_and_execute_write_plan(plan)
+        if rowcount is None:
             return
         self.window.status_message(f"Soft-deleted {rowcount} record(s).")
         self.delete_confirm_checkbox.setChecked(False)
         self._refresh_records()
+
+    def get_ai_context(self, options: dict[str, bool] | None = None) -> dict[str, Any]:
+        context = super().get_ai_context(options)
+        context.update(
+            {
+                "selected_table": self.table_combo.currentText(),
+                "selected_record_id": self.record_combo.currentData(),
+                "current_record": self.current_record,
+                "pending_update": self.pending_update,
+                "advanced_fields_enabled": self.advanced_checkbox.isChecked(),
+            }
+        )
+        return context
 
 
 class ImportExportPage(BasePage):
@@ -1122,6 +1284,12 @@ class ImportExportPage(BasePage):
         self.import_path: str | None = None
 
         layout = QVBoxLayout(self)
+        layout.addWidget(
+            ModernMessageBanner(
+                "Export is always allowed. CSV import still requires a final approval popup before the database is changed.",
+                "primary",
+            )
+        )
         top = QHBoxLayout()
         self.table_combo = QComboBox()
         top.addWidget(QLabel("Table"))
@@ -1269,15 +1437,30 @@ class ImportExportPage(BasePage):
             self.window.show_warning("Import", "Preview the CSV and confirm before importing.")
             return
         table_name = self.table_combo.currentText()
-        try:
-            rows = self.import_frame.to_dict(orient="records")
-            with loading_operation("Importing data...", self.window):
-                imported = bulk_import_records(self.window.active_engine(), table_name, rows, actor=self.window.actor)
-        except Exception as exc:
-            self.window.show_error("Import", exc)
+        plan = self.window.build_import_plan(
+            table_name=table_name,
+            rows=self.import_frame.to_dict(orient="records"),
+            source="manual_ui",
+            reason="Manual CSV import from Import / Export page.",
+        )
+        imported = self.window.review_and_execute_write_plan(plan)
+        if imported is None:
             return
         self.window.status_message(f"Imported {imported} row(s) into {table_name}.")
         self.import_confirm_checkbox.setChecked(False)
+
+    def get_ai_context(self, options: dict[str, bool] | None = None) -> dict[str, Any]:
+        context = super().get_ai_context(options)
+        context.update(
+            {
+                "selected_table": self.table_combo.currentText(),
+                "import_file_name": self.selected_csv_label.text(),
+                "import_preview": dataframe_sample(self.import_frame),
+                "last_filtered_result_table": self.window.last_results_table,
+                "last_filtered_result_sample": dataframe_sample(self.window.last_results),
+            }
+        )
+        return context
 
 
 class AIAssistantPage(BasePage):
@@ -1335,6 +1518,7 @@ class AIAssistantPage(BasePage):
         self.last_plan = None
         self.apply_plan_button.setEnabled(False)
         self.output_edit.clear()
+        self.request_edit.setPlainText("AI chat is also available from the right-side operator panel on every page.")
 
     def on_activated(self) -> None:
         self.refresh_tables()
@@ -1483,6 +1667,18 @@ class AIAssistantPage(BasePage):
         self.window.data_explorer_page.apply_query_plan(self.last_plan)
         self.window.navigate_to("Data Explorer")
 
+    def get_ai_context(self, options: dict[str, bool] | None = None) -> dict[str, Any]:
+        context = super().get_ai_context(options)
+        context.update(
+            {
+                "selected_table": self.table_combo.currentText(),
+                "current_prompt": self.request_edit.toPlainText().strip(),
+                "last_plan": self.last_plan,
+                "last_output": self.output_edit.toPlainText()[:1500],
+            }
+        )
+        return context
+
 
 class AuditLogPage(BasePage):
     def __init__(self, window: "MainWindow") -> None:
@@ -1608,16 +1804,26 @@ class AuditLogPage(BasePage):
         self.window.save_bytes("CSV Files (*.csv)", dataframe_to_csv_bytes(frame), default_name="audit_log.csv")
 
     def create_audit_table(self) -> None:
-        if not self.window.confirm_action("Create Audit Table", "Create audit_log table in the active database?"):
-            return
-        try:
-            with loading_operation("Creating audit log table...", self.window):
-                create_audit_log_table(self.window.active_engine())
-        except Exception as exc:
-            self.window.show_error("Audit Log", exc)
+        plan = self.window.build_create_audit_plan(source="manual_ui", reason="Manual request from Audit Log page.")
+        result = self.window.review_and_execute_write_plan(plan)
+        if result is None:
             return
         self.window.status_message("audit_log table created in the active database.")
         self.refresh_audit_logs()
+
+    def get_ai_context(self, options: dict[str, bool] | None = None) -> dict[str, Any]:
+        context = super().get_ai_context(options)
+        context.update(
+            {
+                "filter_table": self.table_combo.currentText(),
+                "filter_action": self.action_combo.currentText(),
+                "filter_actor": self.actor_edit.text().strip(),
+                "audit_sample": dataframe_sample(self.table_view.dataframe()),
+                "selected_audit_before": self.before_text.toPlainText()[:1200],
+                "selected_audit_after": self.after_text.toPlainText()[:1200],
+            }
+        )
+        return context
 
 
 class SettingsPage(BasePage):
@@ -1683,7 +1889,7 @@ class SettingsPage(BasePage):
     def test_connection(self) -> None:
         status = self.window.manager.current_database_status()
         success, message = test_connection(status["url"])
-        self.connection_label.setText(message)
+        self.connection_label.setText(message if success else friendly_error_text(message))
         if success:
             self.audit_label.setText("audit_log table status can be checked for this database.")
         else:
@@ -1719,16 +1925,25 @@ class SettingsPage(BasePage):
         self.window.status_message(f"Ollama model switched to {model_name}.")
 
     def create_audit_table(self) -> None:
-        if not self.window.confirm_action("Create Audit Table", "Create audit_log table in the active database?"):
-            return
-        try:
-            with loading_operation("Creating audit log table...", self.window):
-                create_audit_log_table(self.window.active_engine())
-        except Exception as exc:
-            self.window.show_error("Settings", exc)
+        plan = self.window.build_create_audit_plan(source="manual_ui", reason="Manual request from Settings page.")
+        result = self.window.review_and_execute_write_plan(plan)
+        if result is None:
             return
         self.window.status_message("audit_log table created in the active database.")
         self.refresh_settings()
+
+    def get_ai_context(self, options: dict[str, bool] | None = None) -> dict[str, Any]:
+        context = super().get_ai_context(options)
+        context.update(
+            {
+                "connection_status": self.connection_label.text(),
+                "audit_status": self.audit_label.text(),
+                "ollama_status": self.ollama_label.text(),
+                "selected_model": self.models_combo.currentText(),
+                "safety_mode": self.window.safety_mode,
+            }
+        )
+        return context
 
 
 class MainWindow(QMainWindow):
@@ -1738,11 +1953,13 @@ class MainWindow(QMainWindow):
         self.actor = settings.app_actor
         self.manager = ConnectionManager()
         self.selected_ollama_model = str(self.manager.state.get("selected_ollama_model") or settings.ollama_model)
+        self.safety_mode = "READ ONLY"
+        self.ai_panel_collapsed = False
         self.last_results = pd.DataFrame()
         self.last_results_table: str | None = None
 
-        self.setWindowTitle("Database Control Center")
-        self.resize(1600, 980)
+        self.setWindowTitle("AI-Assisted Database Investigation & Control Center")
+        self.resize(1740, 980)
 
         self._create_actions()
         self._build_ui()
@@ -1760,32 +1977,49 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
-        layout = QHBoxLayout(central)
+        root_layout = QVBoxLayout(central)
+        root_layout.setContentsMargins(14, 14, 14, 14)
+        root_layout.setSpacing(12)
 
         self.navigation = QListWidget()
         self.navigation.addItems(PAGE_TITLES)
         self.navigation.setFixedWidth(260)
-        layout.addWidget(self.navigation)
+        top_card = AppCard()
+        top_row = QHBoxLayout()
+        self.active_db_badge = PillBadge("DB: -", "primary")
+        self.db_type_badge = PillBadge("Type: -", "primary")
+        self.safety_badge = PillBadge("READ ONLY", "warning")
+        self.ollama_status_badge = PillBadge("Ollama: -", "primary")
+        self.model_badge = PillBadge("Model: -", "primary")
+        self.ai_safety_badge = PillBadge("AI writes require approval", "danger")
+        self.ai_toggle_button = SecondaryButton("Hide AI Panel")
+        top_row.addWidget(self.active_db_badge)
+        top_row.addWidget(self.db_type_badge)
+        top_row.addWidget(self.safety_badge)
+        top_row.addWidget(self.ollama_status_badge)
+        top_row.addWidget(self.model_badge)
+        top_row.addWidget(self.ai_safety_badge)
+        top_row.addStretch(1)
+        top_row.addWidget(self.ai_toggle_button)
+        top_card.content_layout.addLayout(top_row)
+        self.masked_connection_label = QLabel("Connection: -")
+        self.masked_connection_label.setProperty("muted", True)
+        self.masked_connection_label.setWordWrap(True)
+        top_card.content_layout.addWidget(self.masked_connection_label)
+        root_layout.addWidget(top_card)
 
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        layout.addWidget(right, 1)
+        body_layout = QHBoxLayout()
+        body_layout.setSpacing(12)
+        body_layout.addWidget(self.navigation)
 
-        status_frame = QFrame()
-        status_frame.setFrameShape(QFrame.StyledPanel)
-        status_layout = QHBoxLayout(status_frame)
-        self.active_db_label = QLabel("Active DB: -")
-        self.db_type_label = QLabel("DB Type: -")
-        self.ollama_status_label = QLabel("Ollama: -")
-        self.connection_status_label = QLabel("Connection: -")
-        status_layout.addWidget(self.active_db_label)
-        status_layout.addWidget(self.db_type_label)
-        status_layout.addWidget(self.ollama_status_label)
-        status_layout.addWidget(self.connection_status_label, 1)
-        right_layout.addWidget(status_frame)
+        center = QWidget()
+        center_layout = QVBoxLayout(center)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(0)
+        body_layout.addWidget(center, 1)
 
         self.pages = QStackedWidget()
-        right_layout.addWidget(self.pages, 1)
+        center_layout.addWidget(self.pages, 1)
 
         self.connection_page = ConnectionManagerPage(self)
         self.dashboard_page = DashboardPage(self)
@@ -1808,10 +2042,16 @@ class MainWindow(QMainWindow):
             (PAGE_TITLES[7], self.audit_page),
             (PAGE_TITLES[8], self.settings_page),
         ]
-        for _, page in self.page_widgets:
+        for title, page in self.page_widgets:
+            page.page_title = title
             self.pages.addWidget(page)
 
+        self.ai_chat_panel = AIChatPanel(self)
+        body_layout.addWidget(self.ai_chat_panel)
+        root_layout.addLayout(body_layout, 1)
+
         self.navigation.currentRowChanged.connect(self._change_page)
+        self.ai_toggle_button.clicked.connect(self.toggle_ai_panel)
         self.statusBar().showMessage("Ready")
 
     def active_engine(self):
@@ -1828,6 +2068,7 @@ class MainWindow(QMainWindow):
             return
         self.pages.setCurrentIndex(index)
         self.page_widgets[index][1].on_activated()
+        self.statusBar().showMessage(f"Opened {self.current_page_title()}", 3000)
 
     def _notify_all_pages_database_changed(self) -> None:
         for _, page in self.page_widgets:
@@ -1849,14 +2090,59 @@ class MainWindow(QMainWindow):
         except SQLAlchemyError:
             return []
 
+    def allowed_columns_for_table(self, table_name: str) -> list[str]:
+        if not table_name:
+            return []
+        try:
+            metadata = get_table_metadata(self.active_engine(), table_name)
+        except Exception:
+            return []
+        return list(metadata.get("column_names", []))
+
+    def allowed_columns_by_table(self) -> dict[str, list[str]]:
+        result: dict[str, list[str]] = {}
+        for table_name in self.get_available_tables():
+            result[table_name] = self.allowed_columns_for_table(table_name)
+        return result
+
+    def current_page_title(self) -> str:
+        index = self.pages.currentIndex()
+        if index < 0 or index >= len(self.page_widgets):
+            return "Unknown"
+        return self.page_widgets[index][0]
+
+    def current_page_widget(self) -> BasePage:
+        index = self.pages.currentIndex()
+        if index < 0 or index >= len(self.page_widgets):
+            return self.page_widgets[0][1]
+        return self.page_widgets[index][1]
+
+    def current_ai_context(self, options: dict[str, bool] | None = None) -> dict[str, Any]:
+        page_context = self.current_page_widget().get_ai_context(options)
+        status = self.manager.current_database_status()
+        ollama_ok, ollama_message = check_ollama_health()
+        page_context.update(
+            {
+                "page": self.current_page_title(),
+                "active_database_name": status["name"],
+                "database_type": status["type"],
+                "safety_mode": self.safety_mode,
+                "selected_model": self.selected_ollama_model,
+                "ollama_status": "online" if ollama_ok else ollama_message,
+            }
+        )
+        return page_context
+
     def refresh_status_bar(self) -> None:
         status = self.manager.current_database_status()
         db_ok, db_message = test_connection(status["url"])
         ollama_ok, ollama_message = check_ollama_health()
-        self.active_db_label.setText(f"Active DB: {status['name']}")
-        self.db_type_label.setText(f"DB Type: {status['type']}")
-        self.ollama_status_label.setText(f"Ollama: {'Online' if ollama_ok else 'Offline'}")
-        self.connection_status_label.setText(db_message if not db_ok else "Connection: OK")
+        self.active_db_badge.setText(f"DB: {status['name']}")
+        self.db_type_badge.setText(f"Type: {status['type']}")
+        self.safety_badge.setText(self.safety_mode)
+        self.ollama_status_badge.setText("Ollama: Online" if ollama_ok else "Ollama: Offline")
+        self.model_badge.setText(f"Model: {self.selected_ollama_model}")
+        self.masked_connection_label.setText(f"Masked connection: {status['masked_url']}")
         if not db_ok:
             self.statusBar().showMessage("The active database connection is currently failing. Use Connection Manager to switch databases.")
         elif not ollama_ok:
@@ -1871,6 +2157,7 @@ class MainWindow(QMainWindow):
             self.show_warning("Database connection", message)
             self.refresh_status_bar()
             return
+        log_activity("DATABASE_SWITCHED", "Active database switched.", {"database_name": profile.get("name"), "database_type": profile.get("type")})
         self._ensure_demo_database_if_needed()
         self.refresh_status_bar()
         self._notify_all_pages_database_changed()
@@ -1878,7 +2165,6 @@ class MainWindow(QMainWindow):
 
     def status_message(self, message: str) -> None:
         self.statusBar().showMessage(message, 8000)
-        QMessageBox.information(self, "Database Control Center", message)
 
     def save_bytes(self, file_filter: str, payload: bytes, *, default_name: str) -> None:
         file_path, _ = QFileDialog.getSaveFileName(self, "Save file", default_name, file_filter)
@@ -1888,17 +2174,243 @@ class MainWindow(QMainWindow):
         self.status_message(f"Saved file to {file_path}")
 
     def show_error(self, title: str, error: Exception | str) -> None:
-        QMessageBox.critical(self, title, str(error))
+        safe_text = friendly_error_text(error)
+        log_activity("APP_ERROR", f"{title} error", {"details": safe_text, "page": self.current_page_title()})
+        QMessageBox.critical(self, title, safe_text)
 
     def show_warning(self, title: str, message: str) -> None:
-        QMessageBox.warning(self, title, message)
+        safe_message = mask_database_url(message)
+        QMessageBox.warning(self, title, safe_message)
 
     def show_info(self, title: str, message: str) -> None:
-        QMessageBox.information(self, title, message)
+        QMessageBox.information(self, title, mask_database_url(message))
 
     def confirm_action(self, title: str, message: str) -> bool:
         answer = QMessageBox.question(self, title, message, QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         return answer == QMessageBox.Yes
+
+    def toggle_ai_panel(self) -> None:
+        self.ai_panel_collapsed = not self.ai_panel_collapsed
+        self.sync_ai_panel_visibility()
+
+    def sync_ai_panel_visibility(self) -> None:
+        self.ai_chat_panel.setVisible(not self.ai_panel_collapsed)
+        self.ai_toggle_button.setText("Show AI Panel" if self.ai_panel_collapsed else "Hide AI Panel")
+
+    def copy_text_to_clipboard(self, text: str) -> None:
+        QApplication.clipboard().setText(text)
+        self.status_message("Copied to clipboard.")
+
+    def build_insert_plan(
+        self,
+        *,
+        table_name: str,
+        payload: dict[str, Any],
+        include_system_fields: bool,
+        source: str,
+        reason: str,
+    ) -> WriteActionPlan:
+        return WriteActionPlan(
+            action="insert",
+            table=table_name,
+            database_name=self.manager.get_active_database_name(),
+            database_type=get_database_type(self.manager.get_active_database_url()),
+            actor=self.actor,
+            reason=reason,
+            risk_level="medium",
+            source=source,
+            after_data=payload,
+            payload=payload,
+            include_system_fields=include_system_fields,
+            write_summary=f"Insert a new record into {table_name}.",
+        )
+
+    def build_update_plan(
+        self,
+        *,
+        table_name: str,
+        record_id: Any,
+        before_data: dict[str, Any],
+        payload: dict[str, Any],
+        include_system_fields: bool,
+        source: str,
+        reason: str,
+    ) -> WriteActionPlan:
+        metadata = get_table_metadata(self.active_engine(), table_name)
+        after_data = dict(before_data)
+        after_data.update(payload)
+        return WriteActionPlan(
+            action="update",
+            table=table_name,
+            database_name=self.manager.get_active_database_name(),
+            database_type=get_database_type(self.manager.get_active_database_url()),
+            actor=self.actor,
+            reason=reason,
+            risk_level="medium",
+            source=source,
+            primary_key_column=metadata["primary_key"],
+            primary_key_value=record_id,
+            before_data=before_data,
+            after_data=after_data,
+            payload=payload,
+            include_system_fields=include_system_fields,
+            write_summary=f"Update record {record_id} in {table_name}.",
+        )
+
+    def build_soft_delete_plan(
+        self,
+        *,
+        table_name: str,
+        record_id: Any,
+        before_data: dict[str, Any],
+        source: str,
+        reason: str,
+    ) -> WriteActionPlan:
+        metadata = get_table_metadata(self.active_engine(), table_name)
+        after_data = dict(before_data)
+        after_data["deleted_at"] = "CURRENT_TIMESTAMP"
+        return WriteActionPlan(
+            action="soft_delete",
+            table=table_name,
+            database_name=self.manager.get_active_database_name(),
+            database_type=get_database_type(self.manager.get_active_database_url()),
+            actor=self.actor,
+            reason=reason,
+            risk_level="high",
+            source=source,
+            primary_key_column=metadata["primary_key"],
+            primary_key_value=record_id,
+            before_data=before_data,
+            after_data=after_data,
+            payload={},
+            write_summary=f"Soft delete record {record_id} in {table_name}.",
+        )
+
+    def build_import_plan(self, *, table_name: str, rows: list[dict[str, Any]], source: str, reason: str) -> WriteActionPlan:
+        return WriteActionPlan(
+            action="import",
+            table=table_name,
+            database_name=self.manager.get_active_database_name(),
+            database_type=get_database_type(self.manager.get_active_database_url()),
+            actor=self.actor,
+            reason=reason,
+            risk_level="high",
+            source=source,
+            rows=rows,
+            after_data={"row_count": len(rows), "sample": rows[:5]},
+            write_summary=f"Import {len(rows)} row(s) into {table_name}.",
+        )
+
+    def build_create_audit_plan(self, *, source: str, reason: str) -> WriteActionPlan:
+        return WriteActionPlan(
+            action="create_audit_log",
+            table="audit_log",
+            database_name=self.manager.get_active_database_name(),
+            database_type=get_database_type(self.manager.get_active_database_url()),
+            actor=self.actor,
+            reason=reason,
+            risk_level="medium",
+            source=source,
+            after_data={"table_name": "audit_log"},
+            write_summary="Create audit_log table in the active database.",
+        )
+
+    def build_write_plan_from_ai_proposal(self, proposal: dict[str, Any], page_context: dict[str, Any]) -> WriteActionPlan:
+        table_name = str(proposal.get("table") or "")
+        action = str(proposal.get("action") or "")
+        metadata = get_table_metadata(self.active_engine(), table_name)
+        record_id = proposal.get("primary_key_value")
+        before_data: dict[str, Any] | None = None
+        if action in {"update", "soft_delete"} and record_id not in (None, ""):
+            before_data = get_record_by_pk(self.active_engine(), table_name, record_id) or {}
+
+        if action == "insert":
+            return WriteActionPlan(
+                action="insert",
+                table=table_name,
+                database_name=self.manager.get_active_database_name(),
+                database_type=get_database_type(self.manager.get_active_database_url()),
+                actor=self.actor,
+                reason=str(proposal.get("reason") or "AI proposed an insert."),
+                risk_level=str(proposal.get("risk_level") or "medium"),
+                source="ai_operator",
+                after_data=proposal.get("changes") or {},
+                payload=dict(proposal.get("changes") or {}),
+                write_summary=f"AI proposes inserting a new record into {table_name}.",
+            )
+        if action == "update":
+            after_data = dict(before_data or {})
+            after_data.update(dict(proposal.get("changes") or {}))
+            return WriteActionPlan(
+                action="update",
+                table=table_name,
+                database_name=self.manager.get_active_database_name(),
+                database_type=get_database_type(self.manager.get_active_database_url()),
+                actor=self.actor,
+                reason=str(proposal.get("reason") or "AI proposed an update."),
+                risk_level=str(proposal.get("risk_level") or "medium"),
+                source="ai_operator",
+                primary_key_column=metadata["primary_key"],
+                primary_key_value=record_id,
+                before_data=before_data,
+                after_data=after_data,
+                payload=dict(proposal.get("changes") or {}),
+                write_summary=f"AI proposes updating record {record_id} in {table_name}.",
+            )
+        if action == "soft_delete":
+            after_data = dict(before_data or {})
+            after_data["deleted_at"] = "CURRENT_TIMESTAMP"
+            return WriteActionPlan(
+                action="soft_delete",
+                table=table_name,
+                database_name=self.manager.get_active_database_name(),
+                database_type=get_database_type(self.manager.get_active_database_url()),
+                actor=self.actor,
+                reason=str(proposal.get("reason") or "AI proposed a soft delete."),
+                risk_level=str(proposal.get("risk_level") or "high"),
+                source="ai_operator",
+                primary_key_column=metadata["primary_key"],
+                primary_key_value=record_id,
+                before_data=before_data,
+                after_data=after_data,
+                payload={},
+                write_summary=f"AI proposes soft deleting record {record_id} in {table_name}.",
+            )
+        if action == "import":
+            return WriteActionPlan(
+                action="import",
+                table=table_name,
+                database_name=self.manager.get_active_database_name(),
+                database_type=get_database_type(self.manager.get_active_database_url()),
+                actor=self.actor,
+                reason=str(proposal.get("reason") or "AI proposed a bulk import preview."),
+                risk_level=str(proposal.get("risk_level") or "high"),
+                source="ai_operator",
+                rows=[],
+                write_summary=f"AI proposed an import plan for {table_name}.",
+            )
+        raise ValueError("AI proposed an invalid action. No database changes were made.")
+
+    def review_and_execute_write_plan(self, plan: WriteActionPlan) -> Any | None:
+        dialog = ConfirmationPreviewDialog(plan, self)
+        result = dialog.exec()
+        if result != QDialog.Accepted or not dialog.confirmation_token:
+            log_write_rejected(plan, "User cancelled the confirmation dialog.")
+            if plan.source == "ai_operator":
+                log_activity("AI_WRITE_PROPOSAL_REJECTED", "User rejected an AI write proposal.", {"table": plan.table, "action": plan.action})
+            return None
+        log_activity("WRITE_APPROVED", "User approved a database write action.", {"table": plan.table, "action": plan.action, "source": plan.source})
+        if plan.source == "ai_operator":
+            log_activity("AI_WRITE_PROPOSAL_APPROVED", "User approved an AI write proposal.", {"table": plan.table, "action": plan.action})
+        try:
+            with loading_operation("Applying approved database change...", self):
+                result_payload = execute_approved_write(plan, dialog.confirmation_token, self.active_engine())
+        except Exception as exc:
+            self.show_error("Database Change", exc)
+            return None
+        self._notify_all_pages_database_changed()
+        self.refresh_status_bar()
+        return result_payload
 
 
 def build_application() -> QApplication:
@@ -1906,6 +2418,7 @@ def build_application() -> QApplication:
     if app is None:
         app = QApplication(sys.argv)
     app.setApplicationName("Database Control Center")
+    apply_light_style(app)
     return app
 
 
@@ -1914,4 +2427,3 @@ def main() -> int:
     window = MainWindow()
     window.show()
     return app.exec()
-
